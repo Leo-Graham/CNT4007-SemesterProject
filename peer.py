@@ -1,0 +1,92 @@
+# Bare Bones code - referenced this website a lot !! very helpful for some basic p2p functionality
+# https://cs.berry.edu/~nhamid/p2p/framework-python.html
+
+from socket import *
+
+class peer:
+    def __init__(self, serverPort, id):
+        # initialize the peer node
+        self.serverPort = serverPort
+        self.id = id
+
+        # shuts down the peer node - false by default
+        self.shutdown = False
+    
+    # create a server socket for this peer object
+    def createServerSocket(self, port):
+        # uses IPv4 and TCP
+        serverSocket = socket.socket(socket.AF_INET, SOCK_STREAM)
+        serverSocket.setSockOpt(SOL_SOCKET, SO_REUSEADDR, 1)
+        serverSocket.bind('', port)
+
+        # should maybe be changed - decides how many connections in queue
+        serverSocket.listen(5)
+
+        return serverSocket
+    
+    # main loop that runs while the peer is alive
+    def runPeer(self):
+        # instantiates a socket to begin the run loop
+        serverSocket = self.createServerSocket(self.serverPort)
+        serverSocket.settimeout(2)
+        
+        print(f"Server for peer {self.id} is running on port {self.serverPort}")
+
+        # the run loop - should go until keyboard interrupt
+        while not self.shutdown:
+            try: 
+                clientSocket, clientAddr = serverSocket.accept()
+                clientSocket.settimeout(None)
+            except KeyboardInterrupt:
+                self.shutdown = True
+                continue
+            except:
+                continue
+
+        print(f"Peer {self.id} shutting down.")
+        serverSocket.close()
+
+    # handshake message is structured as follows
+    # handshake header (18-byte string) | zero bits (10 bytes) | peer ID (4 bytes) 
+
+    # messages are structured as follows
+    # message length (4 bytes) | message type (1 byte) | message payload (variable)
+
+    # function to handle different message types - specified below
+    # type          | value | payload
+    # choke         | 0 
+    # unchoke       | 1
+    # interested    | 2
+    # not interested| 3
+    # PAYLOAD MESSAGES
+    # have          | 4     | contains 4-byte piece index field as payload
+    # bitfield      | 5     | sent after handshake, bitfield as payload
+    # request       | 6     | contains 4-byte piece index field as payload
+    # piece         | 7     | contains 4-byte piece index field and content of piece as payload
+
+    # might store these in a hash table of function pointers?
+
+    def handlePeer(self, clientSocket):
+        host, port = clientSocket.getpeername()
+
+        # things should happen here
+        # maybe implement a "connection" class like in the tutorial
+
+
+            
+        
+        
+
+
+
+
+
+
+
+    
+
+    
+    
+
+
+
