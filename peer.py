@@ -1,6 +1,7 @@
 # Bare Bones code - referenced this website a lot !! very helpful for some basic p2p functionality
 # https://cs.berry.edu/~nhamid/p2p/framework-python.html
 
+import time
 import random
 import socket
 import struct
@@ -20,10 +21,18 @@ class peer:
     REQUEST = 6
     PIECE = 7
 
-    def __init__(self, server_port, id, num_pieces=8):
+    def __init__(self, server_port, id, num_pieces, k, unchoking_int):
         # initialize the peer node
         self.server_port = int(server_port)
         self.id = int(id)
+        #for choking and unchoking
+        self.k = k
+        self.unchokint_int = unchoking_int
+        self.interest = {}
+        self.choked = {}
+        self.bytes = {}
+        self.preferred_neighbors = []
+        self.optimistic_neighbor = None
 
         # shuts down the peer node - false by default
         self.shutdown = False
@@ -80,6 +89,59 @@ class peer:
 
         print(f"Peer {self.id} shutting down.")
         server_socket.close()
+
+    #choke/unchoke from neighbors download rate
+    def choke_download_rate(self):
+        while not self.shutdown:
+            #wait until next call
+            time.sleep(self.unchokint_int)
+
+            with self.lock:
+                #check if the peer has a completed file, if so then determine randomly from them instead of download rates
+                allTrue = True
+                for i in self.have:
+                    if i == False:
+                        allTrue = False
+                        break
+                if allTrue:
+                    #if have all file pick neighbors randomly instead of by rate
+                    interested = []
+                    for neighbor in self.neighbors:
+                        #get neighbors interested
+                        if self.interest.get(neighbor, False):
+                            interested.append(neighbor)
+                            #pick randomly
+                    chosen = random.sample(interested, min(self.k, len(interested)))
+                else:
+                    #picj bvy download rate
+                    interested = []
+                    for neighbor in self.neighbors:
+                        #get neighbors interested
+                        if self.interest.get(neighbor, False):
+                            interested.append(neighbor)
+                    random.shuffle(interested)
+                    #sort by bytes downloaded amd choose top k
+                    interested.sort(key=lambda c: self.bytes.get(c, 0), reverse=True)
+
+                    chosen = []
+                    for i in range(min(self.k, len(interested))):
+                        chosen.append(interested[i])
+                
+                self.preferred_neighbors = chosen
+
+                for neighbor in self.neighbors:
+                    #loop through and unchole if they are a preferred or optimistic neighbor
+                    if ((neighbor in self.preferred_neighbors) or (neighbor is self.optimistic_neighbor)) != (not self.choked.get(neighbor, True)):
+                        if ((neighbor in self.preferred_neighbors) or (neighbor is self.optimistic_neighbor)):
+                            neighbor.sendMsg(self.UNCHOKE)
+                            self.choked[neighbor] = False
+                        else:
+                            neighbor.sendMsg(self.CHOKE)
+                            self.choked[neighbor] = True
+                for neighbor in self.neighbors:
+                    self.bytes[neighbor] = 0
+
+q
 
     # ---------------- BITFIELD HELPERS ----------------
 
