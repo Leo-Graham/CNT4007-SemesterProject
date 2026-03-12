@@ -21,13 +21,14 @@ class peer:
     REQUEST = 6
     PIECE = 7
 
-    def __init__(self, server_port, id, num_pieces, k, unchoking_int):
+    def __init__(self, server_port, id, num_pieces, k, unchoking_int, opt_unchoking_int):
         # initialize the peer node
         self.server_port = int(server_port)
         self.id = int(id)
         #for choking and unchoking
         self.k = k
         self.unchokint_int = unchoking_int
+        self.opt_unchoking_int = opt_unchoking_int
         self.interest = {}
         self.choked = {}
         self.bytes = {}
@@ -141,8 +142,33 @@ class peer:
                 for neighbor in self.neighbors:
                     self.bytes[neighbor] = 0
 
-q
+    def pick_new_unchoke(self):
+        while not self.shutdown:
+            # wait until next call
+            time.sleep(self.opt_unchoking_int)
+            with self.lock:
+                #get the neighbors that are choked, interested and not preferred
+                chosen = []
+                for neighbor in self.neighbors:
+                    if self.choked.get(neighbor, True) and self.interest.get(neighbor, False) and neighbor not in self.preferred_neighbors:
+                        chosen.append(neighbor)
 
+                #if there are neighbors that are chosen
+                if len(chosen) > 0:
+    
+                    # choose a random neighbor
+                    random.shuffle(chosen)
+                    chosen_neighbor = chosen[0]
+
+                    # choke old optimistic neighbor if its not a preferred neighbor
+                    if self.optimistic_neighbor != None and self.optimistic_neighbor not in self.preferred_neighbors:
+                            self.optimistic_neighbor.sendMsg(self.CHOKE)
+                            self.choked[self.optimistic_neighbor] = True
+
+                    # unchoke the newly selected optimistic neighbor
+                    self.optimistic_neighbor = chosen_neighbor
+                    chosen_neighbor.sendMsg(self.UNCHOKE)
+                    self.choked[chosen_neighbor] = False
     # ---------------- BITFIELD HELPERS ----------------
 
     # packs self.have into bitfield bytes
