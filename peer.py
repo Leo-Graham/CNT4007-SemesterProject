@@ -262,6 +262,9 @@ class peer:
 
         with self.lock:
             self.neighbors.append(connection)
+            self.interest[connection] = False
+            self.choked[connection] = True
+            self.bytes[connection] = 0
 
         try:
             # receive handshake, then send handshake back
@@ -288,6 +291,12 @@ class peer:
                 elif msg_type == self.UNCHOKE:
                     choked_by_remote = False
                     self.request_piece(connection, remote_bitfield)
+
+                elif msg_type == self.INTERESTED:
+                    self.interest[connection] = True
+
+                elif msg_type == self.NOT_INTERESTED:
+                    self.interest[connection] = False
 
                 elif msg_type == self.BITFIELD:
                     remote_bitfield = self.unpack_bitfield(msg_data)
@@ -337,4 +346,7 @@ class peer:
             with self.lock:
                 if connection in self.neighbors:
                     self.neighbors.remove(connection)
+                self.interest.pop(connection, None)
+                self.choked.pop(connection, None)
+                self.bytes.pop(connection, None)
             connection.close()
