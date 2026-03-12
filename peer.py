@@ -350,3 +350,139 @@ class peer:
                 self.choked.pop(connection, None)
                 self.bytes.pop(connection, None)
             connection.close()
+
+    # CONFIG FILE PARSERS
+
+    def parse_common(self, file):
+        # Reads Common.cfg and returns a dictionary.
+        config = {}
+
+        with open(file, "r") as f:
+            for line in f:
+                line = line.strip()
+
+                # Skip empty lines
+                if not line:
+                    continue
+
+                key, value = line.split()
+                if key in (
+                    "NumberOfPreferredNeighbors",
+                    "UnchokingInterval",
+                    "OptimisticUnchokingInterval",
+                    "FileSize",
+                    "PieceSize",
+                ):
+                    config[key] = int(value)
+                else:
+                    config[key] = value
+
+        return config
+
+    def parse_peer(self, file):
+        # Reads PeerInfo.cfg and returns a dictionary keyed by peer ID.
+
+        peers = {}
+
+        with open(file, "r") as f:
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                parts = line.split()
+
+                peer_id = int(parts[0])
+                host = parts[1]
+                port = int(parts[2])
+                has_file = int(parts[3]) == 1
+
+                peers[peer_id] = {
+                    "host": host,
+                    "port": port,
+                    "has_file": has_file,
+                }
+
+        return peers
+    
+    # PIECE REQUEST / TRANSFER 
+
+    def choose_piece(self, remote_bitfield):
+        # Chooses a piece index to request from the neighbor based on their bitfield and what we already have.
+
+        if remote_bitfield is None:
+            return None
+
+        with self.lock:
+            pieces = [
+                i for i in range(self.num_pieces)
+                if remote_bitfield[i] and not self.have[i] and i not in self.requested_pieces
+            ]
+
+            if not pieces:
+                return None
+
+            piece_index = random.choice(pieces)
+
+            # Mark as requested so we do not duplicate requests
+            self.requested_pieces.add(piece_index)
+
+            return piece_index
+
+    def request_piece(self, connection):
+        # Requests a piece from the neighbor if they have any pieces we want and we are not currently choked by them.
+
+        with self.lock:
+            remote_bitfield = self.neighbor_bitfields.get(connection)
+
+        piece_index = self.choose_piece(remote_bitfield)
+
+        if piece_index is None:
+            return
+
+        payload = struct.pack("!I", piece_index)
+        connection.sendMsg(self.REQUEST, payload)
+
+    def send_piece(self, connection, piece_index):
+        # Sends the specified piece to the neighbor if we have it and they requested it.
+
+        with self.lock:
+            if piece_index < 0 or piece_index >= self.num_pieces:
+                return
+
+            if not self.have[piece_index]:
+                return
+
+            piece_data = self.pieces[piece_index]
+
+            if piece_data is None:
+                return
+
+        payload = struct.pack("!I", piece_index) + piece_data
+        connection.sendMsg(self.PIECE, payload)
+
+
+    def store_piece(self, piece_index, piece_data):
+        # Stores the received piece data at the specified index if we do not already have it, and broadcasts a HAVE message to neighbors.
+
+        with self.lock:
+            if piece_index < 0 or piece_index >= self.num_pieces:
+                return False
+
+            if self.have[piece_index]:
+                self.requested_pieces.discard(piece_index)
+                return False
+
+            self.have[piece_index] = True
+            self.pieces[piece_index] = piece_data
+
+            # Once the piece arrives, remove it from requested set
+            self.requested_pieces.discard(piece_index)
+
+            return True
+
+    def count_owned_pieces(self):
+        # Returns the number of pieces we currently have.
+        with self.lock:
+            return sum(1 for x in self.have if x)
