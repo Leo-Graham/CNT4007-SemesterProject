@@ -1,18 +1,15 @@
-# helper class to store information about an established TCP connection
-# between two peers
-
 import socket
 import struct
 
+
 class conn:
-    HANDSHAKE_HEADER = b"P2PFILESHARINGPROJ"   # 18 bytes
-    HANDSHAKE_ZEROS = b"\x00" * 10             # 10 bytes
+    HANDSHAKE_HEADER = b"P2PFILESHARINGPROJ"
+    HANDSHAKE_ZEROS = b"\x00" * 10
     HANDSHAKE_LEN = 32
 
-    # initializes a connection (or stores an existing connection) between
-    # one peer and another
     def __init__(self, peer_id, host=None, port=None, client_socket=None):
-        self.id = peer_id
+        self.id = int(peer_id)
+        self.remote_peer_id = None
 
         if client_socket is None:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -20,37 +17,45 @@ class conn:
         else:
             self.client_socket = client_socket
 
-    # helper function to receive exactly n bytes
-    def _recv_exact(self, n):
+    def _recv_exact(self, size):
         data = b""
-        while len(data) < n:
-            chunk = self.client_socket.recv(n - len(data))
+
+        while len(data) < size:
+            chunk = self.client_socket.recv(size - len(data))
             if not chunk:
                 raise ConnectionError("Socket closed while receiving data.")
             data += chunk
+
         return data
 
-    # ---------------- HANDSHAKE ----------------
-    # handshake header (18-byte string) | zero bits (10 bytes) | peer ID (4 bytes)
-
     def send_handshake(self):
-        msg = (self.HANDSHAKE_HEADER + self.HANDSHAKE_ZEROS+ struct.pack("!I", self.id))
-        self.client_socket.sendall(msg)
+        message = (
+            self.HANDSHAKE_HEADER
+            + self.HANDSHAKE_ZEROS
+            + struct.pack("!I", self.id)
+        )
+        self.client_socket.sendall(message)
 
-    def receive_handshake(self):
+    def receive_handshake(self, expected_peer_id=None):
         data = self._recv_exact(self.HANDSHAKE_LEN)
         header = data[:18]
         zeros = data[18:28]
+        remote_peer_id = struct.unpack("!I", data[28:32])[0]
 
-        peer_id_bytes = data[28:32]
-        remote_peer_id = struct.unpack("!I", peer_id_bytes)[0]
+        if header != self.HANDSHAKE_HEADER:
+            raise ValueError("Invalid handshake header.")
 
+        if zeros != self.HANDSHAKE_ZEROS:
+            raise ValueError("Invalid handshake zero bits.")
+
+        if expected_peer_id is not None and remote_peer_id != int(expected_peer_id):
+            raise ValueError(
+                f"Expected peer ID {expected_peer_id}, received {remote_peer_id}."
+            )
+
+        self.remote_peer_id = remote_peer_id
         return remote_peer_id
 
-    # ---------------- MESSAGES ----------------
-    # message length (4 bytes) | message type (1 byte) | message payload (variable)
-
-    # helper function to create a message based on the message type and data provided
     def createMsg(self, msg_type, msg_data=b""):
         if msg_data is None:
             msg_data = b""
@@ -58,49 +63,44 @@ class conn:
         if not isinstance(msg_data, bytes):
             raise TypeError("msg_data must be bytes.")
 
-        msg_length = 1 + len(msg_data)  # type byte + payload
-        msg = struct.pack("!I", msg_length)
-        msg += struct.pack("!B", msg_type)
-        msg += msg_data
-        return msg
+        message_length = 1 + len(msg_data)
+        return (
+            struct.pack("!I", message_length)
+            + struct.pack("!B", int(msg_type))
+            + msg_data
+        )
 
-    # sends a message through this connection
     def sendMsg(self, msg_type, msg_data=b""):
         try:
-            msg = self.createMsg(msg_type, msg_data)
-            self.client_socket.sendall(msg)
-
+            self.client_socket.sendall(self.createMsg(msg_type, msg_data))
         except KeyboardInterrupt:
             raise
-
         except Exception:
             return False
 
         return True
 
-    # receives a message - returns (msg_type, msg_data)
     def receive(self):
         try:
             length_bytes = self._recv_exact(4)
-            msg_length = struct.unpack("!I", length_bytes)[0]
+            message_length = struct.unpack("!I", length_bytes)[0]
 
-            if msg_length < 1:
+            if message_length < 1:
                 return (None, None)
 
-            msg_body = self._recv_exact(msg_length)
-            msg_type = msg_body[0]
-            msg_data = msg_body[1:]
-
+            body = self._recv_exact(message_length)
         except KeyboardInterrupt:
             raise
-
         except Exception:
             return (None, None)
 
-        return (msg_type, msg_data)
+        return (body[0], body[1:])
 
-    # closes the connection
     def close(self):
         if self.client_socket is not None:
+            try:
+                self.client_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             self.client_socket.close()
             self.client_socket = None
