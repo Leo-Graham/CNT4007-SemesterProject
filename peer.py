@@ -1,15 +1,15 @@
-import argparse
-import math
-import random
 import shutil
 import socket
 import struct
+import argparse
+import math
+import random
 import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-
 from conn import conn
+import contextlib
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_DIR = PROJECT_DIR / "Configs"
@@ -62,7 +62,7 @@ class peer:
         self.piece_size = int(self.common["PieceSize"])
 
         self.base_dir = Path(base_dir).resolve()
-        self.peer_dir = self._resolve_peer_dir()
+        self.peer_dir = self.resolvedir()
         self.peer_dir.mkdir(parents=True, exist_ok=True)
         self.num_pieces = math.ceil(self.file_size / self.piece_size)
 
@@ -90,7 +90,7 @@ class peer:
         }
         self.completion_logged = self.self_info["has_file"]
 
-        self._load_initial_file_if_present()
+        self.loadfile()
 
     @staticmethod
     def parse_common(file_path):
@@ -118,11 +118,11 @@ class peer:
         peers = {}
         with open(file_path, "r", encoding="utf-8") as handle:
             for raw_line in handle:
-                line = raw_line.strip()
-                if not line:
+                check = raw_line.strip()
+                if not check:
                     continue
-                peer_id, host, port, has_file = line.split()
-                peers[int(peer_id)] = {
+                getid, host, port, getnum = check.split()
+                peers[int(getid)] = {
                     "host": host,
                     "port": int(port),
                     "has_file": has_file == "1",
@@ -171,73 +171,65 @@ class peer:
             log_dir=log_dir,
         )
 
-    def _track_thread(self, thread):
+    def trackcurrentthread(self, thread):
         self.threads.append(thread)
         thread.start()
 
-    def _resolve_peer_dir(self):
-        preferred_dir = self.base_dir / f"peer_{self.id}"
-        alternate_dirs = [
+    def resolvedir(self):
+        ret = self.base_dir / f"peer_{self.id}"
+        check = [
             self.base_dir / str(self.id),
             self.base_dir / "Peers" / f"peer_{self.id}",
             self.base_dir / "Peers" / str(self.id),
         ]
 
-        if preferred_dir.exists():
-            return preferred_dir
+        found = next((c for c in check if c.exists()), None)
 
-        for candidate in alternate_dirs:
-            if candidate.exists():
-                preferred_dir.mkdir(parents=True, exist_ok=True)
-                for item in candidate.iterdir():
-                    target = preferred_dir / item.name
-                    if item.is_dir():
-                        shutil.copytree(item, target, dirs_exist_ok=True)
-                    else:
-                        shutil.copy2(item, target)
-                return preferred_dir
+        if found and not ret.exists():
+            shutil.copytree(found, ret, dirs_exist_ok=True)
 
-        return preferred_dir
+        return ret
 
-    def _piece_bounds(self, piece_index):
-        start = piece_index * self.piece_size
+    def bound(self, indpiece):
+        start = indpiece * self.piece_size
         end = min(start + self.piece_size, self.file_size)
         return (start, end)
 
-    def _expected_piece_size(self, piece_index):
-        start, end = self._piece_bounds(piece_index)
+    def getsize(self, indpiece):
+        start, end = self.bound(indpiece)
         return end - start
 
-    def _load_initial_file_if_present(self):
+    def loadfile(self):
         if not self.self_info["has_file"]:
             return
 
-        file_path = self.peer_dir / self.file_name
-        if not file_path.exists():
+        getpath = self.peer_dir / self.file_name
+        if not getpath.exists():
             raise FileNotFoundError(
                 f"Peer {self.id} is marked as having the file, but "
-                f"{file_path} does not exist."
+                f"{getpath} does not exist."
             )
 
-        payload = file_path.read_bytes()
-        if len(payload) != self.file_size:
+        if getpath.stat().st_size != self.file_size:
             raise ValueError(
-                f"Expected {self.file_size} bytes in {file_path}, "
-                f"found {len(payload)}."
+                f"Expected {self.file_size} bytes in {getpath}, "
+                f"found {getpath.stat().st_size}."
             )
 
-        for piece_index in range(self.num_pieces):
-            start, end = self._piece_bounds(piece_index)
-            self.have[piece_index] = True
-            self.pieces[piece_index] = payload[start:end]
+        with getpath.open("rb") as f:
+            for i in range(self.num_pieces):
+                _, end = self.bound(i)
+                size = end - i * self.piece_size
+                self.pieces[i] = f.read(size)
+                self.have[i] = True
 
         self.completed_peers.add(self.id)
 
-    def has_complete_file(self):
+    def ifcompletefile(self):
         with self.lock:
             return all(self.have)
 
-    def count_owned_pieces(self):
+    def numowned(self):
         with self.lock:
             return sum(1 for has_piece in self.have if has_piece)
 
@@ -245,22 +237,22 @@ class peer:
         with self.lock:
             local_have = list(self.have)
 
-        output = bytearray((self.num_pieces + 7) // 8)
-        for piece_index, has_piece in enumerate(local_have):
+        ret = bytearray((self.num_pieces + 7) // 8)
+        for indpiece, has_piece in enumerate(local_have):
             if has_piece:
-                byte_index = piece_index // 8
-                bit_index = 7 - (piece_index % 8)
-                output[byte_index] |= 1 << bit_index
-        return bytes(output)
+                byteind = indpiece // 8
+                bitind = 7 - (indpiece % 8)
+                ret[byteind] |= 1 << bitind
+        return bytes(ret)
 
-    def unpack_bitfield(self, payload):
+    def unpack_bitfield(self, msgbytes):
         result = [False] * self.num_pieces
-        for piece_index in range(self.num_pieces):
-            byte_index = piece_index // 8
-            if byte_index >= len(payload):
+        for indpiece in range(self.num_pieces):
+            byte_index = indpiece // 8
+            if byte_index >= len(msgbytes):
                 break
-            bit_index = 7 - (piece_index % 8)
-            result[piece_index] = bool((payload[byte_index] >> bit_index) & 1)
+            bit_index = 7 - (indpiece % 8)
+            result[indpiece] = bool((msgbytes[byte_index] >> bit_index) & 1)
         return result
 
     def log(self, message):
@@ -270,28 +262,28 @@ class peer:
             with open(self.log_path, "a", encoding="utf-8") as handle:
                 handle.write(line)
 
-    def _send_initial_bitfield(self, remote_peer_id):
-        payload = self.pack_bitfield()
-        if any(payload):
-            self._send_message(remote_peer_id, self.BITFIELD, payload)
+    def sendinitbits(self, remoteid):
+        ret = self.pack_bitfield()
+        if any(ret):
+            self.sendmes(remoteid, self.BITFIELD, ret)
 
-    def _send_message(self, remote_peer_id, msg_type, payload=b""):
+    def sendmes(self, remoteid, msg_type, msgbytes=b""):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
-            connection = state.connection if state is not None else None
+            state = self.neighbor_states.get(remoteid)
+            check = state.connection if state is not None else None
 
-        if connection is None:
+        if check is None:
             return False
 
-        if connection.sendMsg(msg_type, payload):
+        if check.sendMsg(msg_type, msgbytes):
             return True
 
-        self._drop_connection(remote_peer_id)
+        self.dropconn(remoteid)
         return False
 
-    def _remote_has_interesting_piece(self, remote_peer_id):
+    def checkneigborpiece(self, remoteid):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None or state.bitfield is None:
                 return False
             local_have = list(self.have)
@@ -299,158 +291,131 @@ class peer:
 
         return any(remote_piece and not local_piece for remote_piece, local_piece in zip(remote_have, local_have))
 
-    def _update_interest(self, remote_peer_id):
-        interested = self._remote_has_interesting_piece(remote_peer_id)
+    def _update_interest(self, remoteid):
+        interested = self.checkneigborpiece(remoteid)
 
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None or state.i_am_interested == interested:
                 return
             state.i_am_interested = interested
 
         msg_type = self.INTERESTED if interested else self.NOT_INTERESTED
-        self._send_message(remote_peer_id, msg_type)
+        self.sendmes(remoteid, msg_type)
 
-    def _refresh_interests(self):
+    def updateinterest(self):
         with self.lock:
-            peer_ids = list(self.neighbor_states.keys())
+            getlist = list(self.neighbor_states.keys())
 
-        for remote_peer_id in peer_ids:
-            self._update_interest(remote_peer_id)
+        for id in getlist:
+            self._update_interest(id)
 
-    def _write_complete_file(self):
+    def writefile(self):
         with self.lock:
             if not all(self.have):
                 return
-            payload = b"".join(self.pieces)
+            write = b"".join(self.pieces)
 
         file_path = self.peer_dir / self.file_name
-        file_path.write_bytes(payload)
+        file_path.write_bytes(write)
 
-    def _mark_remote_complete_locked(self, remote_peer_id):
-        state = self.neighbor_states.get(remote_peer_id)
+    def markcomplete(self, remoteid):
+        state = self.neighbor_states.get(remoteid)
         if state is not None and state.bitfield is not None and all(state.bitfield):
-            self.completed_peers.add(remote_peer_id)
+            self.completed_peers.add(remoteid)
 
-    def _handle_local_completion(self):
-        should_log = False
+    def localcomplete(self):
+        check = False
 
         with self.lock:
             if all(self.have):
                 self.completed_peers.add(self.id)
                 if not self.completion_logged:
                     self.completion_logged = True
-                    should_log = True
+                    check = True
 
-        self._write_complete_file()
+        self.writefile()
 
-        if should_log:
+        if check:
             self.log(f"Peer {self.id} has downloaded the complete file.")
 
-    def _broadcast_have(self, piece_index):
-        payload = struct.pack("!I", piece_index)
+    def sendhave(self, indpiece):
+        ret = struct.pack("!I", indpiece)
 
         with self.lock:
-            peer_ids = list(self.neighbor_states.keys())
+            getlist = list(self.neighbor_states.keys())
 
-        for remote_peer_id in peer_ids:
-            self._send_message(remote_peer_id, self.HAVE, payload)
+        for id in getlist:
+            self.sendmes(id, self.HAVE, ret)
 
-    def _store_piece(self, remote_peer_id, piece_index, piece_data):
-        expected_size = self._expected_piece_size(piece_index)
-        if len(piece_data) != expected_size:
+    def piececheck(self, remoteid, indpiece, piece_data):
+        if len(piece_data) != self.getsize(indpiece):
             return False
 
         with self.lock:
-            if piece_index < 0 or piece_index >= self.num_pieces:
+            state = self.neighbor_states.get(remoteid)
+
+            if indpiece not in range(self.num_pieces) or state is None or self.have[indpiece]:
                 return False
 
-            state = self.neighbor_states.get(remote_peer_id)
-            if state is None:
-                return False
-
-            if state.outstanding_request == piece_index:
-                state.outstanding_request = None
-
-            self.requested_pieces.discard(piece_index)
-
-            if self.have[piece_index]:
-                return False
-
-            self.have[piece_index] = True
-            self.pieces[piece_index] = piece_data
+            self.have[indpiece] = True
+            self.pieces[indpiece] = piece_data
             state.downloaded_bytes += len(piece_data)
 
-        piece_count = self.count_owned_pieces()
+            if state.outstanding_request == indpiece:
+                state.outstanding_request = None
+
+            self.requested_pieces.discard(indpiece)
+            piece_count = sum(1 for h in self.have if h)
+
         self.log(
-            f"Peer {self.id} has downloaded the piece {piece_index} "
-            f"from {remote_peer_id}. Now the number of pieces it has is {piece_count}."
+            f"Peer {self.id} has downloaded the piece {indpiece} "
+            f"from {remoteid}. Now the number of pieces it has is {piece_count}."
         )
-        self._broadcast_have(piece_index)
-        self._refresh_interests()
-        self._handle_local_completion()
+        self.sendhave(indpiece)
+        self.updateinterest()
+        self.localcomplete()
         return True
 
-    def _request_piece(self, remote_peer_id):
+    def reqpiece(self, remoteid):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
-            if (
-                state is None
-                or state.peer_choking_me
-                or state.outstanding_request is not None
-                or state.bitfield is None
-            ):
+            state = self.neighbor_states.get(remoteid)
+            if not state or state.peer_choking_me or state.outstanding_request is not None or state.bitfield is None:
                 return
 
             candidates = [
-                piece_index
-                for piece_index in range(self.num_pieces)
-                if state.bitfield[piece_index]
-                and not self.have[piece_index]
-                and piece_index not in self.requested_pieces
+                i for i in range(self.num_pieces)
+                if state.bitfield[i] and not self.have[i] and i not in self.requested_pieces
             ]
 
-            if not candidates:
+            if not (indpiece := random.choice(candidates) if candidates else None):
                 return
 
-            piece_index = random.choice(candidates)
-            state.outstanding_request = piece_index
-            self.requested_pieces.add(piece_index)
+            state.outstanding_request = indpiece
+            self.requested_pieces.add(indpiece)
 
-        if not self._send_message(
-            remote_peer_id,
-            self.REQUEST,
-            struct.pack("!I", piece_index),
-        ):
+        if not self.sendmes(remoteid, self.REQUEST, struct.pack("!I", indpiece)):
             with self.lock:
-                state = self.neighbor_states.get(remote_peer_id)
-                if state is not None and state.outstanding_request == piece_index:
+                if (state := self.neighbor_states.get(remoteid)) and state.outstanding_request == indpiece:
                     state.outstanding_request = None
-                self.requested_pieces.discard(piece_index)
-            return
+                self.requested_pieces.discard(indpiece)
 
-    def _send_piece(self, remote_peer_id, piece_index):
+    def sendpiece(self, remoteid, indpiece):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
-            if state is None or state.am_choking_peer:
+            state = self.neighbor_states.get(remoteid)
+            piece_data = self.pieces[indpiece] if indpiece in range(self.num_pieces) else None
+
+            if not state or state.am_choking_peer or not self.have[indpiece] or piece_data is None:
                 return
 
-            if piece_index < 0 or piece_index >= self.num_pieces or not self.have[piece_index]:
-                return
+        self.sendmes(remoteid, self.PIECE, struct.pack("!I", indpiece) + piece_data)
 
-            piece_data = self.pieces[piece_index]
-            if piece_data is None:
-                return
-
-        payload = struct.pack("!I", piece_index) + piece_data
-        self._send_message(remote_peer_id, self.PIECE, payload)
-
-    def _drop_connection(self, remote_peer_id):
+    def dropconn(self, remoteid):
         state = None
         with self.lock:
-            state = self.neighbor_states.pop(remote_peer_id, None)
-            self.preferred_neighbors.discard(remote_peer_id)
-            if self.optimistic_neighbor == remote_peer_id:
+            state = self.neighbor_states.pop(remoteid, None)
+            self.preferred_neighbors.discard(remoteid)
+            if self.optimistic_neighbor == remoteid:
                 self.optimistic_neighbor = None
             if state is not None and state.outstanding_request is not None:
                 self.requested_pieces.discard(state.outstanding_request)
@@ -458,30 +423,30 @@ class peer:
         if state is not None:
             state.connection.close()
 
-    def _register_connection(self, remote_peer_id, connection, initiated_by_me):
+    def regconn(self, remoteid, connection, check):
         with self.lock:
-            if remote_peer_id in self.neighbor_states:
+            if remoteid in self.neighbor_states:
                 return False
-            self.neighbor_states[remote_peer_id] = NeighborState(connection=connection)
+            self.neighbor_states[remoteid] = NeighborState(connection=connection)
 
-        if initiated_by_me:
-            self.log(f"Peer {self.id} makes a connection to Peer {remote_peer_id}.")
+        if check:
+            self.log(f"Peer {self.id} makes a connection to Peer {remoteid}.")
         else:
-            self.log(f"Peer {self.id} is connected from Peer {remote_peer_id}.")
+            self.log(f"Peer {self.id} is connected from Peer {remoteid}.")
 
-        self._send_initial_bitfield(remote_peer_id)
+        self.sendinitbits(remoteid)
 
         thread = threading.Thread(
-            target=self._message_loop,
-            args=(remote_peer_id,),
+            target=self.loopformsg,
+            args=(remoteid,),
             daemon=True,
         )
-        self._track_thread(thread)
+        self.trackcurrentthread(thread)
         return True
 
-    def _handle_choke(self, remote_peer_id):
+    def controlchoke(self, remoteid):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
             state.peer_choking_me = True
@@ -489,123 +454,123 @@ class peer:
                 self.requested_pieces.discard(state.outstanding_request)
                 state.outstanding_request = None
 
-        self.log(f"Peer {self.id} is choked by {remote_peer_id}.")
+        self.log(f"Peer {self.id} is choked by {remoteid}.")
 
-    def _handle_unchoke(self, remote_peer_id):
+    def controlunchoke(self, remoteid):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
             state.peer_choking_me = False
 
-        self.log(f"Peer {self.id} is unchoked by {remote_peer_id}.")
-        self._request_piece(remote_peer_id)
+        self.log(f"Peer {self.id} is unchoked by {remoteid}.")
+        self.reqpiece(remoteid)
 
-    def _handle_interested(self, remote_peer_id):
+    def controlinterested(self, remoteid):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
             state.interested_in_me = True
 
-        self.log(f"Peer {self.id} received the 'interested' message from {remote_peer_id}.")
+        self.log(f"Peer {self.id} received the 'interested' message from {remoteid}.")
 
-    def _handle_not_interested(self, remote_peer_id):
+    def controluninterested(self, remoteid):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
             state.interested_in_me = False
 
         self.log(
-            f"Peer {self.id} received the 'not interested' message from {remote_peer_id}."
+            f"Peer {self.id} received the 'not interested' message from {remoteid}."
         )
 
-    def _handle_bitfield(self, remote_peer_id, payload):
-        remote_bitfield = self.unpack_bitfield(payload)
+    def controlbitfield(self, remoteid, msgbytes):
+        remote_bitfield = self.unpack_bitfield(msgbytes)
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
             state.bitfield = remote_bitfield
-            self._mark_remote_complete_locked(remote_peer_id)
+            self.markcomplete(remoteid)
 
-        self._update_interest(remote_peer_id)
+        self._update_interest(remoteid)
 
-    def _handle_have(self, remote_peer_id, payload):
-        if len(payload) != 4:
+    def controlhave(self, remoteid, msgbytes):
+        if len(msgbytes) != 4:
             return
 
-        piece_index = struct.unpack("!I", payload)[0]
-        if piece_index < 0 or piece_index >= self.num_pieces:
+        indpiece = struct.unpack("!I", msgbytes)[0]
+        if indpiece < 0 or indpiece >= self.num_pieces:
             return
 
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
             if state.bitfield is None:
                 state.bitfield = [False] * self.num_pieces
-            state.bitfield[piece_index] = True
-            self._mark_remote_complete_locked(remote_peer_id)
+            state.bitfield[indpiece] = True
+            self.markcomplete(remoteid)
 
         self.log(
-            f"Peer {self.id} received the 'have' message from {remote_peer_id} "
-            f"for the piece {piece_index}."
+            f"Peer {self.id} received the 'have' message from {remoteid} "
+            f"for the piece {indpiece}."
         )
-        self._update_interest(remote_peer_id)
+        self._update_interest(remoteid)
 
-    def _handle_request(self, remote_peer_id, payload):
-        if len(payload) != 4:
+    def controlreq(self, remoteid, msgbytes):
+        if len(msgbytes) != 4:
             return
 
-        piece_index = struct.unpack("!I", payload)[0]
-        self._send_piece(remote_peer_id, piece_index)
+        indpiece = struct.unpack("!I", msgbytes)[0]
+        self.sendpiece(remoteid, indpiece)
 
-    def _handle_piece(self, remote_peer_id, payload):
-        if len(payload) < 4:
+    def controlpiece(self, remoteid, msgbytes):
+        if len(msgbytes) < 4:
             return
 
-        piece_index = struct.unpack("!I", payload[:4])[0]
-        piece_data = payload[4:]
+        indpiece = struct.unpack("!I", msgbytes[:4])[0]
+        piece_data = msgbytes[4:]
 
-        if self._store_piece(remote_peer_id, piece_index, piece_data):
-            self._request_piece(remote_peer_id)
+        if self.piececheck(remoteid, indpiece, piece_data):
+            self.reqpiece(remoteid)
 
-    def _message_loop(self, remote_peer_id):
+    def loopformsg(self, remoteid):
         try:
             while not self.shutdown_event.is_set():
                 with self.lock:
-                    state = self.neighbor_states.get(remote_peer_id)
+                    state = self.neighbor_states.get(remoteid)
                     connection = state.connection if state is not None else None
 
                 if connection is None:
                     break
 
-                msg_type, payload = connection.receive()
+                msg_type, msgbytes = connection.receive()
                 if msg_type is None:
                     break
 
                 if msg_type == self.CHOKE:
-                    self._handle_choke(remote_peer_id)
+                    self.controlchoke(remoteid)
                 elif msg_type == self.UNCHOKE:
-                    self._handle_unchoke(remote_peer_id)
+                    self.controlunchoke(remoteid)
                 elif msg_type == self.INTERESTED:
-                    self._handle_interested(remote_peer_id)
+                    self.controlinterested(remoteid)
                 elif msg_type == self.NOT_INTERESTED:
-                    self._handle_not_interested(remote_peer_id)
+                    self.controluninterested(remoteid)
                 elif msg_type == self.BITFIELD:
-                    self._handle_bitfield(remote_peer_id, payload)
+                    self.controlbitfield(remoteid, msgbytes)
                 elif msg_type == self.HAVE:
-                    self._handle_have(remote_peer_id, payload)
+                    self.controlhave(remoteid, msgbytes)
                 elif msg_type == self.REQUEST:
-                    self._handle_request(remote_peer_id, payload)
+                    self.controlreq(remoteid, msgbytes)
                 elif msg_type == self.PIECE:
-                    self._handle_piece(remote_peer_id, payload)
+                    self.controlpiece(remoteid, msgbytes)
         finally:
-            self._drop_connection(remote_peer_id)
+            self.dropconn(remoteid)
 
-    def _accept_loop(self):
+    def accloop(self):
         while not self.shutdown_event.is_set():
             try:
                 client_socket, _ = self.server_socket.accept()
@@ -618,69 +583,63 @@ class peer:
             connection = conn(self.id, client_socket=client_socket)
 
             try:
-                remote_peer_id = connection.receive_handshake()
-                if remote_peer_id not in self.peer_infos or remote_peer_id == self.id:
+                remoteid = connection.receive_handshake()
+                if remoteid not in self.peer_infos or remoteid == self.id:
                     raise ValueError("Received handshake from unexpected peer.")
                 connection.send_handshake()
             except Exception:
                 connection.close()
                 continue
 
-            if not self._register_connection(remote_peer_id, connection, initiated_by_me=False):
+            if not self.regconn(remoteid, connection, initiated_by_me=False):
                 connection.close()
 
-    def _connect_to_previous_peer(self, remote_peer_id):
-        remote_info = self.peer_infos[remote_peer_id]
+    def _connect_to_previous_peer(self, remoteid):
+        peerinfo = self.peer_infos[remoteid]
 
-        while not self.shutdown_event.is_set():
+        while not self.shutdown_event.wait(1.0):
             with self.lock:
-                if remote_peer_id in self.neighbor_states:
+                if remoteid in self.neighbor_states:
                     return
 
             connection = None
             try:
-                connection = conn(
-                    self.id,
-                    host=remote_info["host"],
-                    port=remote_info["port"],
-                )
+                connection = conn(self.id, host=peerinfo["host"], port=peerinfo["port"])
                 connection.send_handshake()
-                connection.receive_handshake(expected_peer_id=remote_peer_id)
-                if self._register_connection(remote_peer_id, connection, initiated_by_me=True):
+                connection.receive_handshake(expected_peer_id=remoteid)
+                if self.regconn(remoteid, connection, initiated_by_me=True):
                     return
                 connection.close()
             except Exception:
-                if connection is not None:
+                if connection:
                     connection.close()
 
-            self.shutdown_event.wait(1.0)
-
-    def _set_neighbor_choke_state(self, remote_peer_id, should_choke):
+    def setneighborstate(self, remoteid, should_choke):
         with self.lock:
-            state = self.neighbor_states.get(remote_peer_id)
+            state = self.neighbor_states.get(remoteid)
             if state is None or state.am_choking_peer == should_choke:
                 return
             state.am_choking_peer = should_choke
 
         msg_type = self.CHOKE if should_choke else self.UNCHOKE
-        self._send_message(remote_peer_id, msg_type)
+        self.sendmes(remoteid, msg_type)
 
-    def _preferred_neighbor_loop(self):
+    def prefneighborloop(self):
         while not self.shutdown_event.wait(self.unchoking_interval):
             with self.lock:
                 interested = [
-                    remote_peer_id
-                    for remote_peer_id, state in self.neighbor_states.items()
+                    remoteid
+                    for remoteid, state in self.neighbor_states.items()
                     if state.interested_in_me
                 ]
 
-                if self.has_complete_file():
+                if self.ifcompletefile():
                     random.shuffle(interested)
                     chosen_list = interested[: self.k]
                 else:
                     random.shuffle(interested)
                     interested.sort(
-                        key=lambda remote_peer_id: self.neighbor_states[remote_peer_id].downloaded_bytes,
+                        key=lambda remoteid: self.neighbor_states[remoteid].downloaded_bytes,
                         reverse=True,
                     )
                     chosen_list = interested[: self.k]
@@ -699,21 +658,21 @@ class peer:
                 preferred_text = ", ".join(str(peer_id) for peer_id in chosen_list) or "None"
                 self.log(f"Peer {self.id} has the preferred neighbors {preferred_text}.")
 
-            for remote_peer_id in peer_ids:
+            for remoteid in peer_ids:
                 should_choke = (
-                    remote_peer_id not in chosen
-                    and remote_peer_id != optimistic_neighbor
+                    remoteid not in chosen
+                    and remoteid != optimistic_neighbor
                 )
-                self._set_neighbor_choke_state(remote_peer_id, should_choke)
+                self.setneighborstate(remoteid, should_choke)
 
-    def _optimistic_neighbor_loop(self):
+    def optimisticneighborloop(self):
         while not self.shutdown_event.wait(self.optimistic_unchoking_interval):
             with self.lock:
                 candidates = [
-                    remote_peer_id
-                    for remote_peer_id, state in self.neighbor_states.items()
+                    remoteid
+                    for remoteid, state in self.neighbor_states.items()
                     if state.interested_in_me
-                    and remote_peer_id not in self.preferred_neighbors
+                    and remoteid not in self.preferred_neighbors
                     and state.am_choking_peer
                 ]
 
@@ -730,12 +689,12 @@ class peer:
                 with self.lock:
                     old_is_preferred = old_neighbor in self.preferred_neighbors
                 if not old_is_preferred:
-                    self._set_neighbor_choke_state(old_neighbor, True)
+                    self.setneighborstate(old_neighbor, True)
 
             if new_neighbor is not None:
-                self._set_neighbor_choke_state(new_neighbor, False)
+                self.setneighborstate(new_neighbor, False)
 
-    def _completion_loop(self):
+    def endloop(self):
         while not self.shutdown_event.wait(1.0):
             with self.lock:
                 all_complete = (
@@ -754,35 +713,35 @@ class peer:
         self.server_socket.listen(len(self.peer_infos))
         self.server_socket.settimeout(1.0)
 
-        accept_thread = threading.Thread(target=self._accept_loop, daemon=True)
-        self._track_thread(accept_thread)
+        accept_thread = threading.Thread(target=self.accloop, daemon=True)
+        self.trackcurrentthread(accept_thread)
 
         preferred_thread = threading.Thread(
-            target=self._preferred_neighbor_loop,
+            target=self.prefneighborloop,
             daemon=True,
         )
-        self._track_thread(preferred_thread)
+        self.trackcurrentthread(preferred_thread)
 
         optimistic_thread = threading.Thread(
-            target=self._optimistic_neighbor_loop,
+            target=self.optimisticneighborloop,
             daemon=True,
         )
-        self._track_thread(optimistic_thread)
+        self.trackcurrentthread(optimistic_thread)
 
         completion_thread = threading.Thread(
-            target=self._completion_loop,
+            target=self.endloop,
             daemon=True,
         )
-        self._track_thread(completion_thread)
+        self.trackcurrentthread(completion_thread)
 
         my_position = self.peer_order.index(self.id)
-        for remote_peer_id in self.peer_order[:my_position]:
+        for remoteid in self.peer_order[:my_position]:
             connector_thread = threading.Thread(
-                target=self._connect_to_previous_peer,
-                args=(remote_peer_id,),
+                target=self.reconntopeer,
+                args=(remoteid,),
                 daemon=True,
             )
-            self._track_thread(connector_thread)
+            self.trackcurrentthread(connector_thread)
 
         try:
             while not self.shutdown_event.is_set():
@@ -799,8 +758,8 @@ class peer:
             with self.lock:
                 peer_ids = list(self.neighbor_states.keys())
 
-            for remote_peer_id in peer_ids:
-                self._drop_connection(remote_peer_id)
+            for remoteid in peer_ids:
+                self.dropconn(remoteid)
 
             current_thread = threading.current_thread()
             for thread in self.threads:
