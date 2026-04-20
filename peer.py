@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from conn import conn
-import contextlib
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_DIR = PROJECT_DIR / "Configs"
@@ -62,7 +61,17 @@ class peer:
         self.piece_size = int(self.common["PieceSize"])
 
         self.base_dir = Path(base_dir).resolve()
-        self.peer_dir = self.resolvedir()
+
+        self.peer_dir = self.base_dir / f"peer_{self.id}"
+        check = [
+            self.base_dir / str(self.id),
+            self.base_dir / "Peers" / f"peer_{self.id}",
+            self.base_dir / "Peers" / str(self.id),
+        ]
+        found = next((c for c in check if c.exists()), None)
+        if found and not self.peer_dir.exists():
+            shutil.copytree(found, self.peer_dir, dirs_exist_ok=True)
+
         self.peer_dir.mkdir(parents=True, exist_ok=True)
         self.num_pieces = math.ceil(self.file_size / self.piece_size)
 
@@ -90,7 +99,25 @@ class peer:
         }
         self.completion_logged = self.self_info["has_file"]
 
-        self.loadfile()
+        if self.self_info["has_file"]:
+            getpath = self.peer_dir / self.file_name
+            if not getpath.exists():
+                raise FileNotFoundError(
+                    f"Peer {self.id} is marked as having the file, but "
+                    f"{getpath} does not exist."
+                )
+            if getpath.stat().st_size != self.file_size:
+                raise ValueError(
+                    f"Expected {self.file_size} bytes in {getpath}, "
+                    f"found {getpath.stat().st_size}."
+                )
+            with getpath.open("rb") as f:
+                for i in range(self.num_pieces):
+                    start = i * self.piece_size
+                    size = min(start + self.piece_size, self.file_size) - start
+                    self.pieces[i] = f.read(size)
+                    self.have[i] = True
+            self.completed_peers.add(self.id)
 
     @staticmethod
     def parse_common(file_path):
@@ -125,7 +152,7 @@ class peer:
                 peers[int(getid)] = {
                     "host": host,
                     "port": int(port),
-                    "has_file": has_file == "1",
+                    "has_file": getnum == "1",
                 }
         return peers
 
@@ -175,55 +202,9 @@ class peer:
         self.threads.append(thread)
         thread.start()
 
-    def resolvedir(self):
-        ret = self.base_dir / f"peer_{self.id}"
-        check = [
-            self.base_dir / str(self.id),
-            self.base_dir / "Peers" / f"peer_{self.id}",
-            self.base_dir / "Peers" / str(self.id),
-        ]
-
-        found = next((c for c in check if c.exists()), None)
-
-        if found and not ret.exists():
-            shutil.copytree(found, ret, dirs_exist_ok=True)
-
-        return ret
-
-    def bound(self, indpiece):
-        start = indpiece * self.piece_size
-        end = min(start + self.piece_size, self.file_size)
-        return (start, end)
-
     def getsize(self, indpiece):
-        start, end = self.bound(indpiece)
-        return end - start
-
-    def loadfile(self):
-        if not self.self_info["has_file"]:
-            return
-
-        getpath = self.peer_dir / self.file_name
-        if not getpath.exists():
-            raise FileNotFoundError(
-                f"Peer {self.id} is marked as having the file, but "
-                f"{getpath} does not exist."
-            )
-
-        if getpath.stat().st_size != self.file_size:
-            raise ValueError(
-                f"Expected {self.file_size} bytes in {getpath}, "
-                f"found {getpath.stat().st_size}."
-            )
-
-        with getpath.open("rb") as f:
-            for i in range(self.num_pieces):
-                _, end = self.bound(i)
-                size = end - i * self.piece_size
-                self.pieces[i] = f.read(size)
-                self.have[i] = True
-
-        self.completed_peers.add(self.id)
+        start = indpiece * self.piece_size
+        return min(start + self.piece_size, self.file_size) - start
 
     def ifcompletefile(self):
         with self.lock:
@@ -265,21 +246,20 @@ class peer:
     def sendinitbits(self, remoteid):
         ret = self.pack_bitfield()
         if any(ret):
-            self.sendmes(remoteid, self.BITFIELD, ret)
-
-    def sendmes(self, remoteid, msg_type, msgbytes=b""):
-        with self.lock:
-            state = self.neighbor_states.get(remoteid)
-            check = state.connection if state is not None else None
-
-        if check is None:
-            return False
-
-        if check.sendMsg(msg_type, msgbytes):
-            return True
-
-        self.dropconn(remoteid)
-        return False
+            with self.lock:
+                state = self.neighbor_states.get(remoteid)
+                check = state.connection if state is not None else None
+            if check is not None:
+                if not check.sendMsg(self.BITFIELD, ret):
+                    with self.lock:
+                        state = self.neighbor_states.pop(remoteid, None)
+                        self.preferred_neighbors.discard(remoteid)
+                        if self.optimistic_neighbor == remoteid:
+                            self.optimistic_neighbor = None
+                        if state is not None and state.outstanding_request is not None:
+                            self.requested_pieces.discard(state.outstanding_request)
+                    if state is not None:
+                        state.connection.close()
 
     def checkneigborpiece(self, remoteid):
         with self.lock:
@@ -301,7 +281,20 @@ class peer:
             state.i_am_interested = interested
 
         msg_type = self.INTERESTED if interested else self.NOT_INTERESTED
-        self.sendmes(remoteid, msg_type)
+        with self.lock:
+            state = self.neighbor_states.get(remoteid)
+            check = state.connection if state is not None else None
+        if check is not None:
+            if not check.sendMsg(msg_type):
+                with self.lock:
+                    state = self.neighbor_states.pop(remoteid, None)
+                    self.preferred_neighbors.discard(remoteid)
+                    if self.optimistic_neighbor == remoteid:
+                        self.optimistic_neighbor = None
+                    if state is not None and state.outstanding_request is not None:
+                        self.requested_pieces.discard(state.outstanding_request)
+                if state is not None:
+                    state.connection.close()
 
     def updateinterest(self):
         with self.lock:
@@ -309,15 +302,6 @@ class peer:
 
         for id in getlist:
             self._update_interest(id)
-
-    def writefile(self):
-        with self.lock:
-            if not all(self.have):
-                return
-            write = b"".join(self.pieces)
-
-        file_path = self.peer_dir / self.file_name
-        file_path.write_bytes(write)
 
     def markcomplete(self, remoteid):
         state = self.neighbor_states.get(remoteid)
@@ -333,20 +317,13 @@ class peer:
                 if not self.completion_logged:
                     self.completion_logged = True
                     check = True
-
-        self.writefile()
+        with self.lock:
+            if all(self.have):
+                write = b"".join(self.pieces)
+                (self.peer_dir / self.file_name).write_bytes(write)
 
         if check:
             self.log(f"Peer {self.id} has downloaded the complete file.")
-
-    def sendhave(self, indpiece):
-        ret = struct.pack("!I", indpiece)
-
-        with self.lock:
-            getlist = list(self.neighbor_states.keys())
-
-        for id in getlist:
-            self.sendmes(id, self.HAVE, ret)
 
     def piececheck(self, remoteid, indpiece, piece_data):
         if len(piece_data) != self.getsize(indpiece):
@@ -372,7 +349,26 @@ class peer:
             f"Peer {self.id} has downloaded the piece {indpiece} "
             f"from {remoteid}. Now the number of pieces it has is {piece_count}."
         )
-        self.sendhave(indpiece)
+
+        ret = struct.pack("!I", indpiece)
+        with self.lock:
+            getlist = list(self.neighbor_states.keys())
+        for id in getlist:
+            with self.lock:
+                state = self.neighbor_states.get(id)
+                check = state.connection if state is not None else None
+            if check is not None:
+                if not check.sendMsg(self.HAVE, ret):
+                    with self.lock:
+                        state = self.neighbor_states.pop(id, None)
+                        self.preferred_neighbors.discard(id)
+                        if self.optimistic_neighbor == id:
+                            self.optimistic_neighbor = None
+                        if state is not None and state.outstanding_request is not None:
+                            self.requested_pieces.discard(state.outstanding_request)
+                    if state is not None:
+                        state.connection.close()
+
         self.updateinterest()
         self.localcomplete()
         return True
@@ -394,42 +390,53 @@ class peer:
             state.outstanding_request = indpiece
             self.requested_pieces.add(indpiece)
 
-        if not self.sendmes(remoteid, self.REQUEST, struct.pack("!I", indpiece)):
+        with self.lock:
+            state = self.neighbor_states.get(remoteid)
+            check = state.connection if state is not None else None
+        if check is None or not check.sendMsg(self.REQUEST, struct.pack("!I", indpiece)):
             with self.lock:
                 if (state := self.neighbor_states.get(remoteid)) and state.outstanding_request == indpiece:
                     state.outstanding_request = None
                 self.requested_pieces.discard(indpiece)
+            if check is None:
+                with self.lock:
+                    state = self.neighbor_states.pop(remoteid, None)
+                    self.preferred_neighbors.discard(remoteid)
+                    if self.optimistic_neighbor == remoteid:
+                        self.optimistic_neighbor = None
+                    if state is not None and state.outstanding_request is not None:
+                        self.requested_pieces.discard(state.outstanding_request)
+                if state is not None:
+                    state.connection.close()
 
     def sendpiece(self, remoteid, indpiece):
         with self.lock:
             state = self.neighbor_states.get(remoteid)
             piece_data = self.pieces[indpiece] if indpiece in range(self.num_pieces) else None
 
-            if not state or state.am_choking_peer or not self.have[indpiece] or piece_data is None:
+            if not state or state.am_choking_peer or piece_data is None or not self.have[indpiece]:
                 return
 
-        self.sendmes(remoteid, self.PIECE, struct.pack("!I", indpiece) + piece_data)
+            check = state.connection
 
-    def dropconn(self, remoteid):
-        state = None
-        with self.lock:
-            state = self.neighbor_states.pop(remoteid, None)
-            self.preferred_neighbors.discard(remoteid)
-            if self.optimistic_neighbor == remoteid:
-                self.optimistic_neighbor = None
-            if state is not None and state.outstanding_request is not None:
-                self.requested_pieces.discard(state.outstanding_request)
+        if not check.sendMsg(self.PIECE, struct.pack("!I", indpiece) + piece_data):
+            with self.lock:
+                state = self.neighbor_states.pop(remoteid, None)
+                self.preferred_neighbors.discard(remoteid)
+                if self.optimistic_neighbor == remoteid:
+                    self.optimistic_neighbor = None
+                if state is not None and state.outstanding_request is not None:
+                    self.requested_pieces.discard(state.outstanding_request)
+            if state is not None:
+                state.connection.close()
 
-        if state is not None:
-            state.connection.close()
-
-    def regconn(self, remoteid, connection, check):
+    def regconn(self, remoteid, connection, initiated_by_me):
         with self.lock:
             if remoteid in self.neighbor_states:
                 return False
             self.neighbor_states[remoteid] = NeighborState(connection=connection)
 
-        if check:
+        if initiated_by_me:
             self.log(f"Peer {self.id} makes a connection to Peer {remoteid}.")
         else:
             self.log(f"Peer {self.id} is connected from Peer {remoteid}.")
@@ -568,31 +575,15 @@ class peer:
                 elif msg_type == self.PIECE:
                     self.controlpiece(remoteid, msgbytes)
         finally:
-            self.dropconn(remoteid)
-
-    def accloop(self):
-        while not self.shutdown_event.is_set():
-            try:
-                client_socket, _ = self.server_socket.accept()
-                client_socket.settimeout(None)
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-
-            connection = conn(self.id, client_socket=client_socket)
-
-            try:
-                remoteid = connection.receive_handshake()
-                if remoteid not in self.peer_infos or remoteid == self.id:
-                    raise ValueError("Received handshake from unexpected peer.")
-                connection.send_handshake()
-            except Exception:
-                connection.close()
-                continue
-
-            if not self.regconn(remoteid, connection, initiated_by_me=False):
-                connection.close()
+            with self.lock:
+                state = self.neighbor_states.pop(remoteid, None)
+                self.preferred_neighbors.discard(remoteid)
+                if self.optimistic_neighbor == remoteid:
+                    self.optimistic_neighbor = None
+                if state is not None and state.outstanding_request is not None:
+                    self.requested_pieces.discard(state.outstanding_request)
+            if state is not None:
+                state.connection.close()
 
     def _connect_to_previous_peer(self, remoteid):
         peerinfo = self.peer_infos[remoteid]
@@ -622,7 +613,20 @@ class peer:
             state.am_choking_peer = should_choke
 
         msg_type = self.CHOKE if should_choke else self.UNCHOKE
-        self.sendmes(remoteid, msg_type)
+        with self.lock:
+            state = self.neighbor_states.get(remoteid)
+            check = state.connection if state is not None else None
+        if check is not None:
+            if not check.sendMsg(msg_type):
+                with self.lock:
+                    state = self.neighbor_states.pop(remoteid, None)
+                    self.preferred_neighbors.discard(remoteid)
+                    if self.optimistic_neighbor == remoteid:
+                        self.optimistic_neighbor = None
+                    if state is not None and state.outstanding_request is not None:
+                        self.requested_pieces.discard(state.outstanding_request)
+                if state is not None:
+                    state.connection.close()
 
     def prefneighborloop(self):
         while not self.shutdown_event.wait(self.unchoking_interval):
@@ -713,35 +717,42 @@ class peer:
         self.server_socket.listen(len(self.peer_infos))
         self.server_socket.settimeout(1.0)
 
-        accept_thread = threading.Thread(target=self.accloop, daemon=True)
-        self.trackcurrentthread(accept_thread)
+        def accloop():
+            while not self.shutdown_event.is_set():
+                try:
+                    client_socket, _ = self.server_socket.accept()
+                    client_socket.settimeout(None)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
 
-        preferred_thread = threading.Thread(
-            target=self.prefneighborloop,
-            daemon=True,
-        )
-        self.trackcurrentthread(preferred_thread)
+                connection = conn(self.id, client_socket=client_socket)
 
-        optimistic_thread = threading.Thread(
-            target=self.optimisticneighborloop,
-            daemon=True,
-        )
-        self.trackcurrentthread(optimistic_thread)
+                try:
+                    remoteid = connection.receive_handshake()
+                    if remoteid not in self.peer_infos or remoteid == self.id:
+                        raise ValueError("Received handshake from unexpected peer.")
+                    connection.send_handshake()
+                except Exception:
+                    connection.close()
+                    continue
 
-        completion_thread = threading.Thread(
-            target=self.endloop,
-            daemon=True,
-        )
-        self.trackcurrentthread(completion_thread)
+                if not self.regconn(remoteid, connection, initiated_by_me=False):
+                    connection.close()
+
+        self.trackcurrentthread(threading.Thread(target=accloop, daemon=True))
+        self.trackcurrentthread(threading.Thread(target=self.prefneighborloop, daemon=True))
+        self.trackcurrentthread(threading.Thread(target=self.optimisticneighborloop, daemon=True))
+        self.trackcurrentthread(threading.Thread(target=self.endloop, daemon=True))
 
         my_position = self.peer_order.index(self.id)
         for remoteid in self.peer_order[:my_position]:
-            connector_thread = threading.Thread(
-                target=self.reconntopeer,
+            self.trackcurrentthread(threading.Thread(
+                target=self._connect_to_previous_peer,
                 args=(remoteid,),
                 daemon=True,
-            )
-            self.trackcurrentthread(connector_thread)
+            ))
 
         try:
             while not self.shutdown_event.is_set():
@@ -759,7 +770,15 @@ class peer:
                 peer_ids = list(self.neighbor_states.keys())
 
             for remoteid in peer_ids:
-                self.dropconn(remoteid)
+                with self.lock:
+                    state = self.neighbor_states.pop(remoteid, None)
+                    self.preferred_neighbors.discard(remoteid)
+                    if self.optimistic_neighbor == remoteid:
+                        self.optimistic_neighbor = None
+                    if state is not None and state.outstanding_request is not None:
+                        self.requested_pieces.discard(state.outstanding_request)
+                if state is not None:
+                    state.connection.close()
 
             current_thread = threading.current_thread()
             for thread in self.threads:
