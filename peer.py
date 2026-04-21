@@ -22,12 +22,12 @@ LEGACY_PEERINFO_CFG = PROJECT_DIR / "PeerInfo.cfg"
 class NeighborState:
     connection: conn
     bitfield: list[bool] | None = None
-    interested_in_me: bool = False
-    i_am_interested: bool = False
-    am_choking_peer: bool = True
-    peer_choking_me: bool = True
-    downloaded_bytes: int = 0
-    outstanding_request: int | None = None
+    isinterested: bool = False
+    checkinterest: bool = False
+    ischoking: bool = True
+    beingchoked: bool = True
+    downbytes: int = 0
+    checkrequest: int | None = None
 
 
 class peer:
@@ -210,10 +210,6 @@ class peer:
         with self.lock:
             return all(self.have)
 
-    def numowned(self):
-        with self.lock:
-            return sum(1 for has_piece in self.have if has_piece)
-
     def pack_bitfield(self):
         with self.lock:
             local_have = list(self.have)
@@ -225,16 +221,6 @@ class peer:
                 bitind = 7 - (indpiece % 8)
                 ret[byteind] |= 1 << bitind
         return bytes(ret)
-
-    def unpack_bitfield(self, msgbytes):
-        result = [False] * self.num_pieces
-        for indpiece in range(self.num_pieces):
-            byte_index = indpiece // 8
-            if byte_index >= len(msgbytes):
-                break
-            bit_index = 7 - (indpiece % 8)
-            result[indpiece] = bool((msgbytes[byte_index] >> bit_index) & 1)
-        return result
 
     def log(self, message):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -250,14 +236,17 @@ class peer:
                 state = self.neighbor_states.get(remoteid)
                 check = state.connection if state is not None else None
             if check is not None:
-                if not check.sendMsg(self.BITFIELD, ret):
+                try:
+                    if not check.sendMsg(self.BITFIELD, ret):
+                        raise RuntimeError
+                except Exception:
                     with self.lock:
                         state = self.neighbor_states.pop(remoteid, None)
                         self.preferred_neighbors.discard(remoteid)
                         if self.optimistic_neighbor == remoteid:
                             self.optimistic_neighbor = None
-                        if state is not None and state.outstanding_request is not None:
-                            self.requested_pieces.discard(state.outstanding_request)
+                        if state is not None and state.checkrequest is not None:
+                            self.requested_pieces.discard(state.checkrequest)
                     if state is not None:
                         state.connection.close()
 
@@ -271,37 +260,35 @@ class peer:
 
         return any(remote_piece and not local_piece for remote_piece, local_piece in zip(remote_have, local_have))
 
-    def _update_interest(self, remoteid):
-        interested = self.checkneigborpiece(remoteid)
-
-        with self.lock:
-            state = self.neighbor_states.get(remoteid)
-            if state is None or state.i_am_interested == interested:
-                return
-            state.i_am_interested = interested
-
-        msg_type = self.INTERESTED if interested else self.NOT_INTERESTED
-        with self.lock:
-            state = self.neighbor_states.get(remoteid)
-            check = state.connection if state is not None else None
-        if check is not None:
-            if not check.sendMsg(msg_type):
-                with self.lock:
-                    state = self.neighbor_states.pop(remoteid, None)
-                    self.preferred_neighbors.discard(remoteid)
-                    if self.optimistic_neighbor == remoteid:
-                        self.optimistic_neighbor = None
-                    if state is not None and state.outstanding_request is not None:
-                        self.requested_pieces.discard(state.outstanding_request)
-                if state is not None:
-                    state.connection.close()
-
     def updateinterest(self):
         with self.lock:
             getlist = list(self.neighbor_states.keys())
 
         for id in getlist:
-            self._update_interest(id)
+            interested = self.checkneigborpiece(id)
+            with self.lock:
+                state = self.neighbor_states.get(id)
+                if state is None or state.checkinterest == interested:
+                    continue
+                state.checkinterest = interested
+            msg_type = self.INTERESTED if interested else self.NOT_INTERESTED
+            with self.lock:
+                state = self.neighbor_states.get(id)
+                check = state.connection if state is not None else None
+            if check is not None:
+                try:
+                    if not check.sendMsg(msg_type):
+                        raise RuntimeError
+                except Exception:
+                    with self.lock:
+                        state = self.neighbor_states.pop(id, None)
+                        self.preferred_neighbors.discard(id)
+                        if self.optimistic_neighbor == id:
+                            self.optimistic_neighbor = None
+                        if state is not None and state.checkrequest is not None:
+                            self.requested_pieces.discard(state.checkrequest)
+                    if state is not None:
+                        state.connection.close()
 
     def markcomplete(self, remoteid):
         state = self.neighbor_states.get(remoteid)
@@ -317,10 +304,13 @@ class peer:
                 if not self.completion_logged:
                     self.completion_logged = True
                     check = True
-        with self.lock:
-            if all(self.have):
-                write = b"".join(self.pieces)
-                (self.peer_dir / self.file_name).write_bytes(write)
+        try:
+            with self.lock:
+                if all(self.have):
+                    write = b"".join(self.pieces)
+                    (self.peer_dir / self.file_name).write_bytes(write)
+        except OSError as e:
+            self.log(f"Peer {self.id} failed to write file: {e}")
 
         if check:
             self.log(f"Peer {self.id} has downloaded the complete file.")
@@ -337,10 +327,10 @@ class peer:
 
             self.have[indpiece] = True
             self.pieces[indpiece] = piece_data
-            state.downloaded_bytes += len(piece_data)
+            state.downbytes += len(piece_data)
 
-            if state.outstanding_request == indpiece:
-                state.outstanding_request = None
+            if state.checkrequest == indpiece:
+                state.checkrequest = None
 
             self.requested_pieces.discard(indpiece)
             piece_count = sum(1 for h in self.have if h)
@@ -358,14 +348,17 @@ class peer:
                 state = self.neighbor_states.get(id)
                 check = state.connection if state is not None else None
             if check is not None:
-                if not check.sendMsg(self.HAVE, ret):
+                try:
+                    if not check.sendMsg(self.HAVE, ret):
+                        raise RuntimeError
+                except Exception:
                     with self.lock:
                         state = self.neighbor_states.pop(id, None)
                         self.preferred_neighbors.discard(id)
                         if self.optimistic_neighbor == id:
                             self.optimistic_neighbor = None
-                        if state is not None and state.outstanding_request is not None:
-                            self.requested_pieces.discard(state.outstanding_request)
+                        if state is not None and state.checkrequest is not None:
+                            self.requested_pieces.discard(state.checkrequest)
                     if state is not None:
                         state.connection.close()
 
@@ -376,7 +369,7 @@ class peer:
     def reqpiece(self, remoteid):
         with self.lock:
             state = self.neighbor_states.get(remoteid)
-            if not state or state.peer_choking_me or state.outstanding_request is not None or state.bitfield is None:
+            if not state or state.beingchoked or state.checkrequest is not None or state.bitfield is None:
                 return
 
             candidates = [
@@ -387,16 +380,19 @@ class peer:
             if not (indpiece := random.choice(candidates) if candidates else None):
                 return
 
-            state.outstanding_request = indpiece
+            state.checkrequest = indpiece
             self.requested_pieces.add(indpiece)
 
         with self.lock:
             state = self.neighbor_states.get(remoteid)
             check = state.connection if state is not None else None
-        if check is None or not check.sendMsg(self.REQUEST, struct.pack("!I", indpiece)):
+        try:
+            if check is None or not check.sendMsg(self.REQUEST, struct.pack("!I", indpiece)):
+                raise RuntimeError
+        except Exception:
             with self.lock:
-                if (state := self.neighbor_states.get(remoteid)) and state.outstanding_request == indpiece:
-                    state.outstanding_request = None
+                if (state := self.neighbor_states.get(remoteid)) and state.checkrequest == indpiece:
+                    state.checkrequest = None
                 self.requested_pieces.discard(indpiece)
             if check is None:
                 with self.lock:
@@ -404,8 +400,8 @@ class peer:
                     self.preferred_neighbors.discard(remoteid)
                     if self.optimistic_neighbor == remoteid:
                         self.optimistic_neighbor = None
-                    if state is not None and state.outstanding_request is not None:
-                        self.requested_pieces.discard(state.outstanding_request)
+                    if state is not None and state.checkrequest is not None:
+                        self.requested_pieces.discard(state.checkrequest)
                 if state is not None:
                     state.connection.close()
 
@@ -414,19 +410,22 @@ class peer:
             state = self.neighbor_states.get(remoteid)
             piece_data = self.pieces[indpiece] if indpiece in range(self.num_pieces) else None
 
-            if not state or state.am_choking_peer or piece_data is None or not self.have[indpiece]:
+            if not state or state.ischoking or piece_data is None or not self.have[indpiece]:
                 return
 
             check = state.connection
 
-        if not check.sendMsg(self.PIECE, struct.pack("!I", indpiece) + piece_data):
+        try:
+            if not check.sendMsg(self.PIECE, struct.pack("!I", indpiece) + piece_data):
+                raise RuntimeError
+        except Exception:
             with self.lock:
                 state = self.neighbor_states.pop(remoteid, None)
                 self.preferred_neighbors.discard(remoteid)
                 if self.optimistic_neighbor == remoteid:
                     self.optimistic_neighbor = None
-                if state is not None and state.outstanding_request is not None:
-                    self.requested_pieces.discard(state.outstanding_request)
+                if state is not None and state.checkrequest is not None:
+                    self.requested_pieces.discard(state.checkrequest)
             if state is not None:
                 state.connection.close()
 
@@ -456,10 +455,10 @@ class peer:
             state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
-            state.peer_choking_me = True
-            if state.outstanding_request is not None:
-                self.requested_pieces.discard(state.outstanding_request)
-                state.outstanding_request = None
+            state.beingchoked = True
+            if state.checkrequest is not None:
+                self.requested_pieces.discard(state.checkrequest)
+                state.checkrequest = None
 
         self.log(f"Peer {self.id} is choked by {remoteid}.")
 
@@ -468,7 +467,7 @@ class peer:
             state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
-            state.peer_choking_me = False
+            state.beingchoked = False
 
         self.log(f"Peer {self.id} is unchoked by {remoteid}.")
         self.reqpiece(remoteid)
@@ -478,7 +477,7 @@ class peer:
             state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
-            state.interested_in_me = True
+            state.isinterested = True
 
         self.log(f"Peer {self.id} received the 'interested' message from {remoteid}.")
 
@@ -487,14 +486,21 @@ class peer:
             state = self.neighbor_states.get(remoteid)
             if state is None:
                 return
-            state.interested_in_me = False
+            state.isinterested = False
 
         self.log(
             f"Peer {self.id} received the 'not interested' message from {remoteid}."
         )
 
     def controlbitfield(self, remoteid, msgbytes):
-        remote_bitfield = self.unpack_bitfield(msgbytes)
+        remote_bitfield = [False] * self.num_pieces
+        for indpiece in range(self.num_pieces):
+            byte_index = indpiece // 8
+            if byte_index >= len(msgbytes):
+                break
+            bit_index = 7 - (indpiece % 8)
+            remote_bitfield[indpiece] = bool((msgbytes[byte_index] >> bit_index) & 1)
+
         with self.lock:
             state = self.neighbor_states.get(remoteid)
             if state is None:
@@ -502,7 +508,30 @@ class peer:
             state.bitfield = remote_bitfield
             self.markcomplete(remoteid)
 
-        self._update_interest(remoteid)
+        interested = self.checkneigborpiece(remoteid)
+        with self.lock:
+            state = self.neighbor_states.get(remoteid)
+            if state is None or state.checkinterest == interested:
+                return
+            state.checkinterest = interested
+        msg_type = self.INTERESTED if interested else self.NOT_INTERESTED
+        with self.lock:
+            state = self.neighbor_states.get(remoteid)
+            check = state.connection if state is not None else None
+        if check is not None:
+            try:
+                if not check.sendMsg(msg_type):
+                    raise RuntimeError
+            except Exception:
+                with self.lock:
+                    state = self.neighbor_states.pop(remoteid, None)
+                    self.preferred_neighbors.discard(remoteid)
+                    if self.optimistic_neighbor == remoteid:
+                        self.optimistic_neighbor = None
+                    if state is not None and state.checkrequest is not None:
+                        self.requested_pieces.discard(state.checkrequest)
+                if state is not None:
+                    state.connection.close()
 
     def controlhave(self, remoteid, msgbytes):
         if len(msgbytes) != 4:
@@ -525,7 +554,31 @@ class peer:
             f"Peer {self.id} received the 'have' message from {remoteid} "
             f"for the piece {indpiece}."
         )
-        self._update_interest(remoteid)
+
+        interested = self.checkneigborpiece(remoteid)
+        with self.lock:
+            state = self.neighbor_states.get(remoteid)
+            if state is None or state.checkinterest == interested:
+                return
+            state.checkinterest = interested
+        msg_type = self.INTERESTED if interested else self.NOT_INTERESTED
+        with self.lock:
+            state = self.neighbor_states.get(remoteid)
+            check = state.connection if state is not None else None
+        if check is not None:
+            try:
+                if not check.sendMsg(msg_type):
+                    raise RuntimeError
+            except Exception:
+                with self.lock:
+                    state = self.neighbor_states.pop(remoteid, None)
+                    self.preferred_neighbors.discard(remoteid)
+                    if self.optimistic_neighbor == remoteid:
+                        self.optimistic_neighbor = None
+                    if state is not None and state.checkrequest is not None:
+                        self.requested_pieces.discard(state.checkrequest)
+                if state is not None:
+                    state.connection.close()
 
     def controlreq(self, remoteid, msgbytes):
         if len(msgbytes) != 4:
@@ -580,12 +633,12 @@ class peer:
                 self.preferred_neighbors.discard(remoteid)
                 if self.optimistic_neighbor == remoteid:
                     self.optimistic_neighbor = None
-                if state is not None and state.outstanding_request is not None:
-                    self.requested_pieces.discard(state.outstanding_request)
+                if state is not None and state.checkrequest is not None:
+                    self.requested_pieces.discard(state.checkrequest)
             if state is not None:
                 state.connection.close()
 
-    def _connect_to_previous_peer(self, remoteid):
+    def connecttoprev(self, remoteid):
         peerinfo = self.peer_infos[remoteid]
 
         while not self.shutdown_event.wait(1.0):
@@ -608,23 +661,26 @@ class peer:
     def setneighborstate(self, remoteid, should_choke):
         with self.lock:
             state = self.neighbor_states.get(remoteid)
-            if state is None or state.am_choking_peer == should_choke:
+            if state is None or state.ischoking == should_choke:
                 return
-            state.am_choking_peer = should_choke
+            state.ischoking = should_choke
 
         msg_type = self.CHOKE if should_choke else self.UNCHOKE
         with self.lock:
             state = self.neighbor_states.get(remoteid)
             check = state.connection if state is not None else None
         if check is not None:
-            if not check.sendMsg(msg_type):
+            try:
+                if not check.sendMsg(msg_type):
+                    raise RuntimeError
+            except Exception:
                 with self.lock:
                     state = self.neighbor_states.pop(remoteid, None)
                     self.preferred_neighbors.discard(remoteid)
                     if self.optimistic_neighbor == remoteid:
                         self.optimistic_neighbor = None
-                    if state is not None and state.outstanding_request is not None:
-                        self.requested_pieces.discard(state.outstanding_request)
+                    if state is not None and state.checkrequest is not None:
+                        self.requested_pieces.discard(state.checkrequest)
                 if state is not None:
                     state.connection.close()
 
@@ -634,7 +690,7 @@ class peer:
                 interested = [
                     remoteid
                     for remoteid, state in self.neighbor_states.items()
-                    if state.interested_in_me
+                    if state.isinterested
                 ]
 
                 if self.ifcompletefile():
@@ -643,7 +699,7 @@ class peer:
                 else:
                     random.shuffle(interested)
                     interested.sort(
-                        key=lambda remoteid: self.neighbor_states[remoteid].downloaded_bytes,
+                        key=lambda remoteid: self.neighbor_states[remoteid].downbytes,
                         reverse=True,
                     )
                     chosen_list = interested[: self.k]
@@ -653,7 +709,7 @@ class peer:
                 self.preferred_neighbors = chosen
 
                 for state in self.neighbor_states.values():
-                    state.downloaded_bytes = 0
+                    state.downbytes = 0
 
                 optimistic_neighbor = self.optimistic_neighbor
                 peer_ids = list(self.neighbor_states.keys())
@@ -675,9 +731,9 @@ class peer:
                 candidates = [
                     remoteid
                     for remoteid, state in self.neighbor_states.items()
-                    if state.interested_in_me
+                    if state.isinterested
                     and remoteid not in self.preferred_neighbors
-                    and state.am_choking_peer
+                    and state.ischoking
                 ]
 
                 old_neighbor = self.optimistic_neighbor
@@ -749,7 +805,7 @@ class peer:
         my_position = self.peer_order.index(self.id)
         for remoteid in self.peer_order[:my_position]:
             self.trackcurrentthread(threading.Thread(
-                target=self._connect_to_previous_peer,
+                target=self.connecttoprev,
                 args=(remoteid,),
                 daemon=True,
             ))
@@ -775,8 +831,8 @@ class peer:
                     self.preferred_neighbors.discard(remoteid)
                     if self.optimistic_neighbor == remoteid:
                         self.optimistic_neighbor = None
-                    if state is not None and state.outstanding_request is not None:
-                        self.requested_pieces.discard(state.outstanding_request)
+                    if state is not None and state.checkrequest is not None:
+                        self.requested_pieces.discard(state.checkrequest)
                 if state is not None:
                     state.connection.close()
 
