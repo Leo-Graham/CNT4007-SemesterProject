@@ -297,20 +297,20 @@ class peer:
 
     def localcomplete(self):
         check = False
-
+        write = None
         with self.lock:
             if all(self.have):
                 self.completed_peers.add(self.id)
                 if not self.completion_logged:
                     self.completion_logged = True
                     check = True
-        try:
-            with self.lock:
-                if all(self.have):
-                    write = b"".join(self.pieces)
-                    (self.peer_dir / self.file_name).write_bytes(write)
-        except OSError as e:
-            self.log(f"Peer {self.id} failed to write file: {e}")
+                write = b"".join(self.pieces)
+
+        if write is not None:
+            try:
+                (self.peer_dir / self.file_name).write_bytes(write)
+            except OSError as e:
+                self.log(f"Peer {self.id} failed to write file: {e}")
 
         if check:
             self.log(f"Peer {self.id} has downloaded the complete file.")
@@ -377,7 +377,8 @@ class peer:
                 if state.bitfield[i] and not self.have[i] and i not in self.requested_pieces
             ]
 
-            if not (indpiece := random.choice(candidates) if candidates else None):
+            indpiece = random.choice(candidates) if candidates else None
+            if indpiece is None:
                 return
 
             state.checkrequest = indpiece
@@ -638,7 +639,7 @@ class peer:
             if state is not None:
                 state.connection.close()
 
-    def connecttoprev(self, remoteid):
+    def _connect_to_previous_peer(self, remoteid):
         peerinfo = self.peer_infos[remoteid]
 
         while not self.shutdown_event.wait(1.0):
@@ -805,7 +806,7 @@ class peer:
         my_position = self.peer_order.index(self.id)
         for remoteid in self.peer_order[:my_position]:
             self.trackcurrentthread(threading.Thread(
-                target=self.connecttoprev,
+                target=self._connect_to_previous_peer,
                 args=(remoteid,),
                 daemon=True,
             ))
